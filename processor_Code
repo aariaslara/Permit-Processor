@@ -1,0 +1,108 @@
+import os
+import time
+import locale
+import re
+import xlwings as xw
+from datetime import datetime
+
+def process_permits():
+    # === Set locale for Spanish month names ===
+    locale.setlocale(locale.LC_TIME, "es_MX.UTF-8")
+    
+    # === Get current year and month ===
+    current_year = time.strftime("%Y")
+    current_month = time.strftime("%B")
+    
+    # === Define file paths (replace with your own paths or config) ===
+    workpermit_paths = [
+        f"YOUR_WORK_PERMIT_PATH/{current_year}/{current_month}",
+        f"YOUR_RESIDENCE_PATH/{current_year}/{current_month}",
+    ]
+    txt_output_path = "YOUR_OUTPUT_PATH/Processed_Permits.txt"
+
+    # === Initialize tracking variables ===
+    header = "TagID, ImportTime, Name, Mez, Date, Service, Price"
+    existing_tag_ids = set()
+    last_import_time = None
+    
+    # === Load previously processed data ===
+    if os.path.exists(txt_output_path):
+        with open(txt_output_path, "r", encoding="utf-8") as txt_file:
+            lines = txt_file.readlines()
+            if lines:
+                header_line = lines[0].strip()
+                data_lines = lines[1:] if header_line == header else lines
+                for line in data_lines:
+                    try:
+                        tag_id, import_time, *_ = line.strip().split(", ")
+                        existing_tag_ids.add(tag_id)
+                        try:
+                            timestamp = datetime.strptime(import_time, "%m/%d/%Y")
+                            last_import_time = max(last_import_time or timestamp, timestamp)
+                        except ValueError:
+                            print(f"Skipping invalid date format: {import_time}")
+                    except ValueError:
+                        print(f"Skipping malformed line: {line}")
+    if last_import_time is None:
+        last_import_time = datetime(2023, 1, 1)
+
+    # === Extract data from file names ===
+    records = []
+    for path in workpermit_paths:
+        if os.path.exists(path):
+            for folder in os.listdir(path):
+                folder_path = os.path.join(path, folder)
+                if os.path.isdir(folder_path):
+                    for file in os.listdir(folder_path):
+                        if file.endswith(".pdf"):
+                            match = re.match(r"(i-(\d+)) ([A-Za-z]+) ([A-Za-z]+) (\d{6})(?: (\d+))?", file.replace(".pdf", "").replace("_", " "))
+                            if match:
+                                full_form, form_number, first_name, last_name, date, price = match.groups()
+                                date = str(date).zfill(6)
+                                month, day, year = int(date[:2]), int(date[2:4]), int("20" + date[4:])
+                                formatted_date = datetime(year, month, day).strftime("%m/%d/%Y")
+                                spanish_month = datetime(year, month, day).strftime("%B").capitalize()
+                                price = float(price) if price else None
+                                tag_id = f"{form_number}{first_name[:2]}{last_name[:2]}{date}"
+                                import_time = datetime.now().strftime("%m/%d/%Y")
+                                file_datetime = datetime(year, month, day)
+                                if file_datetime > last_import_time:
+                                    records.append([tag_id, import_time, f"{first_name} {last_name}", spanish_month, formatted_date, full_form, price])
+
+    # === Load Excel workbook and service mapping ===
+    wb = xw.books.active
+    ws_services = wb.sheets[4]
+    services_data = ws_services.range("Services_Table").value
+    services_dict = {row[0]: (row[1], row[2]) for row in services_data[1:]}
+
+    # === Prepare new records ===
+    new_records = []
+    for record in records:
+        tag_id, import_time, name, month_name, formatted_date, form_number, price = record
+        if form_number in services_dict:
+            service_name, service_price = services_dict[form_number]
+            form_number = service_name
+            if price is None:
+                price = service_price
+        if tag_id not in existing_tag_ids:
+            new_records.append(f"{tag_id}, {import_time}, {name}, {month_name}, {formatted_date}, {form_number}, {price}")
+
+    # === Write new records to text file ===
+    with open(txt_output_path, "a", encoding="utf-8") as txt_file:
+        if os.path.getsize(txt_output_path) == 0:
+            txt_file.write(header + "\n")
+        for record in new_records:
+            txt_file.write(record + "\n")
+
+    print(f"Updated data written to: {txt_output_path}")
+
+    # === Append to master Excel table ===
+    ws_master = wb.sheets[5]
+    data_rows = [rec.split(", ") for rec in new_records]
+    try:
+        table = ws_master.api.ListObjects("master_list")
+        for row in data_rows:
+            table.ListRows.Add().Range.Value = row
+        print(f"{len(data_rows)} new record(s) added to 'master_list'.")
+    except Exception as e:
+        print(f"Failed to update 'master_list': {e}")
